@@ -1,0 +1,1 @@
+./a.out -d 0 -rhs 1 -forward -mtx 
