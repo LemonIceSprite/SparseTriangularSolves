@@ -9,8 +9,11 @@ int selction (int nnz_rowperlevel){
     if (nnz_rowperlevel > THRESHOLD_VALUE)
     {
         return 1;
-    }else     return 0;
-    
+    }
+    else
+    {
+        return 0;
+    }    
 }
 
 double sptrsv_syncfree_opencl (const int           *csrColIdx,
@@ -39,7 +42,7 @@ double sptrsv_syncfree_opencl (const int           *csrColIdx,
     int err = 0;
     
     // set device
-    BasicCL basicCL;
+    BasicCL             basicCL;
     cl_event            ceTimer;                 // OpenCL event
     cl_ulong            queuedTime;
     cl_ulong            submitTime;
@@ -187,7 +190,7 @@ double sptrsv_syncfree_opencl (const int           *csrColIdx,
     // Create the program
     cl_program          ocl_program_sptrsv;
     
-    size_t source_size_sptrsv[] = { strlen(ocl_source_code_sptrsv)};
+    size_t source_size_sptrsv[] = {strlen(ocl_source_code_sptrsv)};
     
     ocl_program_sptrsv = clCreateProgramWithSource(cxGpuContext, 1, &ocl_source_code_sptrsv, source_size_sptrsv, &err);
     
@@ -323,7 +326,7 @@ double sptrsv_syncfree_opencl (const int           *csrColIdx,
                 int num_blocks = ceil ((double)(levelend-levelstart) / (double)(num_threads/THREADS_PER_ROW));
                 szGlobalWorkSize[0] = num_blocks * szLocalWorkSize[0];
                 int ROWS_PER_BLOCK  = THREADS_PER_BLOCK / THREADS_PER_ROW;
-                err |= clSetKernelArg(ocl_kernel_sptrsv_levelset, 6,  sizeof(cl_int), (void*)&levelstart);
+                err  = clSetKernelArg(ocl_kernel_sptrsv_levelset, 6,  sizeof(cl_int), (void*)&levelstart);
                 err |= clSetKernelArg(ocl_kernel_sptrsv_levelset, 7,  sizeof(cl_int), (void*)&levelend);
                 err |= clSetKernelArg(ocl_kernel_sptrsv_levelset, 8,  sizeof(cl_int), (void*)&ROWS_PER_BLOCK);
                 err |= clSetKernelArg(ocl_kernel_sptrsv_levelset, 9,  sizeof(cl_int), (void*)&THREADS_PER_ROW);
@@ -382,53 +385,79 @@ double sptrsv_syncfree_opencl (const int           *csrColIdx,
     //==================================================================    pure openmp   ========================================================
     
     //==================================================================      adaptive    ========================================================
-    
+    int numProcs = omp_get_num_procs();
     for(int loop = 0; loop < BENCH_REPEAT; loop++)
     {//printf("%d\n",loop);
         for (int k = 0; k < nlevel; k++) {//the kth level
             if (selction(levelPtr[k+1] - levelPtr[k]))
-                //if(1)
-                //if(0)
             {
-                int THREADS_PER_ROW;
                 levelstart = levelPtr[k];
                 levelend = levelPtr[k+1];
-                if (nnz_rowperlevel[k] <=  2) {
-                    THREADS_PER_ROW = 2;
+#pragma omp parallel for
+                for (int i = 0; i < numProcs; i++)
+                {
+                    gettimeofday(&time_begin,NULL);
+                    /* each cpu thread calculate 10 times */
+                    int cpu_load = 10;
+                    int midpoint = levelstart + (numProcs-1) * cpu_load;
+                    if (i != numProcs-1)
+                    {
+                        for (int j = i; j < i+cpu_load; j++)
+                        {
+                            int r = levelItem[level_start + j];//the row need be solved
+                            int s = 0;
+                            int now = csrRowPtr[r];
+                            while(now < csrRowPtr[r+1]-1)
+                            {
+                                s += (csrVal[now] * svm_results_host[csrColIdx[now]]);
+                                now++;
+                            }
+                            svm_results_host[r] = (b[r] - s) / csrVal[now];
+                        }
+                    }else
+                    {
+                        int THREADS_PER_ROW;
+                        if (nnz_rowperlevel[k] <=  2) {
+                            THREADS_PER_ROW = 2;
+                        }
+                        else if (nnz_rowperlevel[k] <=  4) {
+                            THREADS_PER_ROW = 4;
+                        }
+                        else if (nnz_rowperlevel[k] <=  8) {
+                            THREADS_PER_ROW = 8;
+                        }
+                        else if (nnz_rowperlevel[k] <= 16) {
+                            THREADS_PER_ROW = 16;
+                        }
+                        else if (nnz_rowperlevel[k] <= 32) {
+                            THREADS_PER_ROW = 32;
+                        }
+                        else
+                            THREADS_PER_ROW = 64;
+                        int num_threads = THREADS_PER_BLOCK;
+                        szLocalWorkSize[0]  = num_threads;
+                        int num_blocks = ceil ((double)(levelend-midpoint) / (double)(num_threads/THREADS_PER_ROW));
+                        szGlobalWorkSize[0] = num_blocks * szLocalWorkSize[0];
+                        int ROWS_PER_BLOCK  = THREADS_PER_BLOCK / THREADS_PER_ROW;
+                        err  = clSetKernelArg(ocl_kernel_sptrsv_levelset, 6,  sizeof(cl_int), (void*)&midpoint);
+                        err |= clSetKernelArg(ocl_kernel_sptrsv_levelset, 7,  sizeof(cl_int), (void*)&levelend);
+                        err |= clSetKernelArg(ocl_kernel_sptrsv_levelset, 8,  sizeof(cl_int), (void*)&ROWS_PER_BLOCK);
+                        err |= clSetKernelArg(ocl_kernel_sptrsv_levelset, 9,  sizeof(cl_int), (void*)&THREADS_PER_ROW);
+                        err |= clSetKernelArg(ocl_kernel_sptrsv_levelset, 10, sizeof(VALUE_TYPE) * (ROWS_PER_BLOCK * THREADS_PER_ROW + THREADS_PER_ROW / 2), NULL);
+                        err |= clSetKernelArg(ocl_kernel_sptrsv_levelset, 11,  sizeof(cl_mem), (void*)&svm_results);
+                        err = clEnqueueNDRangeKernel(ocl_command_queue, ocl_kernel_sptrsv_levelset, 1,
+                                                        NULL, szGlobalWorkSize, szLocalWorkSize, 0, NULL, &ceTimer);
+                        if(err != CL_SUCCESS) { printf("ocl_kernel_sptrsv_levelset kernel run error = %i\n", err); return err; }
+                        err = clWaitForEvents(1, &ceTimer);
+                        if(err != CL_SUCCESS) { printf("event error = %i\n", err); return err; }
+                        basicCL.getEventTimer(ceTimer, &queuedTime, &submitTime, &startTime, &endTime);
+                        // time_opencl_analysis += double(endTime - startTime) / 1000000.0;
+                        // leveltime_of_opencl[k] += double(endTime - startTime) / 1000000.0;
+                    }
+                    gettimeofday(&time_end,NULL);
+                    leveltime_of_opencl[k] += ((time_end.tv_sec-time_begin.tv_sec + (time_end.tv_usec-time_begin.tv_usec)/1000000.0)*1000);
+                    time_opencl_analysis += ((time_end.tv_sec-time_begin.tv_sec + (time_end.tv_usec-time_begin.tv_usec)/1000000.0)*1000);
                 }
-                else if (nnz_rowperlevel[k] <=  4) {
-                    THREADS_PER_ROW = 4;
-                }
-                else if (nnz_rowperlevel[k] <=  8) {
-                    THREADS_PER_ROW = 8;
-                }
-                else if (nnz_rowperlevel[k] <= 16) {
-                    THREADS_PER_ROW = 16;
-                }
-                else if (nnz_rowperlevel[k] <= 32) {
-                    THREADS_PER_ROW = 32;
-                }
-                else
-                    THREADS_PER_ROW = 64;
-                int num_threads = THREADS_PER_BLOCK;
-                szLocalWorkSize[0]  = num_threads;
-                int num_blocks = ceil ((double)(levelend-levelstart) / (double)(num_threads/THREADS_PER_ROW));
-                szGlobalWorkSize[0] = num_blocks * szLocalWorkSize[0];
-                int ROWS_PER_BLOCK  = THREADS_PER_BLOCK / THREADS_PER_ROW;
-                err |= clSetKernelArg(ocl_kernel_sptrsv_levelset, 6,  sizeof(cl_int), (void*)&levelstart);
-                err |= clSetKernelArg(ocl_kernel_sptrsv_levelset, 7,  sizeof(cl_int), (void*)&levelend);
-                err |= clSetKernelArg(ocl_kernel_sptrsv_levelset, 8,  sizeof(cl_int), (void*)&ROWS_PER_BLOCK);
-                err |= clSetKernelArg(ocl_kernel_sptrsv_levelset, 9,  sizeof(cl_int), (void*)&THREADS_PER_ROW);
-                err |= clSetKernelArg(ocl_kernel_sptrsv_levelset, 10, sizeof(VALUE_TYPE) * (ROWS_PER_BLOCK * THREADS_PER_ROW + THREADS_PER_ROW / 2), NULL);
-                err |= clSetKernelArg(ocl_kernel_sptrsv_levelset, 11,  sizeof(cl_mem), (void*)&svm_results);
-                err = clEnqueueNDRangeKernel(ocl_command_queue, ocl_kernel_sptrsv_levelset, 1,
-                                             NULL, szGlobalWorkSize, szLocalWorkSize, 0, NULL, &ceTimer);
-                if(err != CL_SUCCESS) { printf("ocl_kernel_sptrsv_levelset kernel run error = %i\n", err); return err; }
-                err = clWaitForEvents(1, &ceTimer);
-                if(err != CL_SUCCESS) { printf("event error = %i\n", err); return err; }
-                basicCL.getEventTimer(ceTimer, &queuedTime, &submitTime, &startTime, &endTime);
-                time_opencl_analysis += double(endTime - startTime) / 1000000.0;
-                leveltime_of_opencl[k] += double(endTime - startTime) / 1000000.0;
             }
             else
             {
